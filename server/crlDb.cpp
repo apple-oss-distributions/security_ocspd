@@ -303,7 +303,7 @@ CSSM_RETURN CrlDatabase::lookupPriv(
 
 	query.RecordType = CSSM_DL_DB_RECORD_X509_CRL;
 	query.Conjunctive = CSSM_DB_AND;
-	query.NumSelectionPredicates = predPtr - pred;
+	query.NumSelectionPredicates = (uint32)(predPtr - pred);
 	query.SelectionPredicate = pred;
 	query.QueryLimits.TimeLimit = 0;	// FIXME - meaningful?
 	query.QueryLimits.SizeLimit = 1;	// FIXME - meaningful?
@@ -353,6 +353,10 @@ bool CrlDatabase::lookup(
 	CSSM_DL_DB_HANDLE			dlDbHand = {mDlHand, dbHand};
 
 	crtn = lookupPriv(dbHand, url, issuer, &verifyTime, &resultHand, &record, NULL, &dbCrl);
+	if(crtn) {
+		ocspdCrlDebug("CrlDatabase::lookupPriv result %d", crtn);
+	}
+
 	if(resultHand) {
 		CSSM_DL_DataAbortQuery(dlDbHand, resultHand);
 	}
