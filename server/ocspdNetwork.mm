@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012 Apple Inc. All rights reserved.
+ * Copyright (c) 2012-2014 Apple Inc. All rights reserved.
  *
  * @APPLE_LICENSE_HEADER_START@
  *
@@ -36,12 +36,15 @@
 #include <security_cdsa_utils/cuEnc64.h>
 #include <security_cdsa_utils/cuFileIo.h>
 #include <stdlib.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <dispatch/dispatch.h>
 #include <Security/cssmapple.h>
 #include <security_utilities/cfutilities.h>
 #include <CoreServices/CoreServices.h>
 #include <SystemConfiguration/SCDynamicStoreCopySpecific.h>
+#include <SystemConfiguration/SCNetworkReachability.h>
 
 #include <Foundation/Foundation.h>
 
@@ -61,6 +64,7 @@ extern Mutex gFileWriteLock;
 extern Mutex gListLock;
 extern CFMutableArrayRef gDownloadList;
 extern CFMutableDictionaryRef gIssuersDict;
+extern CFAbsoluteTime gLastActivity;
 
 extern bool crlSignatureValid(
 	const char *crlFileName,
@@ -93,6 +97,7 @@ static const char* SYSTEM_KC_PATH = "/Library/Keychains/System.keychain";
 	NSMutableURLRequest *_request;
 	NSURLConnection *_connection;
 	NSMutableData *_receivedData;
+	CFAbsoluteTime _timeToGiveUp;
 	NSData *_data;
 	NSTimer *_timer;
 	NSError *_error;
@@ -104,6 +109,7 @@ static const char* SYSTEM_KC_PATH = "/Library/Keychains/System.keychain";
 - (void)startLoad;
 - (void)syncLoad;
 - (void)cancelLoad;
+- (void)resetTimeout;
 - (BOOL)finished;
 - (NSData *)data;
 - (NSError*)error;
@@ -134,12 +140,16 @@ static const char* SYSTEM_KC_PATH = "/Library/Keychains/System.keychain";
 	if (!_request) {
 		_request = [[NSMutableURLRequest alloc] initWithURL:_url];
 	}
+
+	// Set cache policy to always load from origin and not the local cache
+	[_request setCachePolicy:NSURLRequestReloadIgnoringLocalCacheData];
+
 	return _request;
 }
 
 - (void)startLoad
 {
-	// Cancel any load currently in progress
+	// Cancel any load currently in progress and clear instance variables
 	[self cancelLoad];
 
 	_finished = NO;
@@ -149,11 +159,17 @@ static const char* SYSTEM_KC_PATH = "/Library/Keychains/System.keychain";
 
 	// Start the download
 	_connection = [[NSURLConnection alloc] initWithRequest:[self request] delegate:self];
+	if (!_connection) {
+		ocspdDebug("Failed to open connection (is network available?)");
+		[self timeout];
+		return;
+	}
 
 	// Start the timer
-	_timer = [NSTimer scheduledTimerWithTimeInterval:READ_STREAM_TIMEOUT target:self
-		selector:@selector(timeout)
-		userInfo:nil repeats:NO];
+	[self resetTimeout];
+	_timer = [NSTimer scheduledTimerWithTimeInterval:1.0 target:self
+		selector:@selector(timeoutCheck)
+		userInfo:nil repeats:YES];
 	[_timer retain];
 }
 
@@ -192,12 +208,25 @@ static const char* SYSTEM_KC_PATH = "/Library/Keychains/System.keychain";
 	}
 }
 
-- (void)timeout
+- (void)timeoutCheck
 {
+	if (_finished) {
+		return; // already completed
+	}
+	if (_timeToGiveUp > CFAbsoluteTimeGetCurrent()) {
+		return; // not time yet...
+	}
+	// give up and cancel the download
 	[self cancelLoad];
 	OSStatus err = CSSMERR_APPLETP_NETWORK_FAILURE;
 	_error = [[NSError alloc] initWithDomain:NSOSStatusErrorDomain code:err userInfo:nil];
 	_finished = YES;
+}
+
+- (void)resetTimeout
+{
+	gLastActivity = CFAbsoluteTimeGetCurrent();
+	_timeToGiveUp = gLastActivity + READ_STREAM_TIMEOUT;
 }
 
 - (BOOL)finished
@@ -218,7 +247,11 @@ static const char* SYSTEM_KC_PATH = "/Library/Keychains/System.keychain";
 /* NSURLConnection delegate methods */
 - (void)connection:(NSURLConnection *)connection didReceiveData:(NSData *)newData
 {
+	if (![newData length])
+		return;
+
 	[_receivedData appendData:newData];
+	[self resetTimeout];
 }
 
 - (void)connectionDidFinishLoading:(NSURLConnection *)connection
@@ -287,7 +320,7 @@ static const char* SYSTEM_KC_PATH = "/Library/Keychains/System.keychain";
 		NSLog(@"SecItemCopyMatching returned %d looking up host=%@, port=%d",
 			(int)status, host, (int)port);
 		#endif
-		if (result) {
+		if (!status && result) {
 			if (CFDictionaryGetTypeID() == CFGetTypeID(result)) {
 				NSString *account = [(NSDictionary *)result objectForKey:(id)kSecAttrAccount];
 				NSData *passwordData = [(NSDictionary *)result objectForKey:(id)kSecValueData];
@@ -325,6 +358,15 @@ static const char* SYSTEM_KC_PATH = "/Library/Keychains/System.keychain";
 		NSLog(@"You can specify the username and password for a proxy server with /usr/bin/security. Example:  sudo security add-internet-password -a squiduser -l \"HTTP Proxy\" -P 3128 -r 'http' -s localhost -w squidpass -U -T /usr/sbin/ocspd /Library/Keychains/System.keychain");
 		printedHint = true;
 	}
+	// Cancel the challenge since we do not have a credential to present (14761252)
+	[[challenge sender] cancelAuthenticationChallenge:challenge];
+}
+
+/* NSURLConnectionDataDelegate methods */
+- (NSCachedURLResponse *)connection:(NSURLConnection *)connection willCacheResponse:(NSCachedURLResponse *)cachedResponse
+{
+	// Returning nil prevents the loader from passing the response to the URL cache sub-system for caching.
+	return (NSCachedURLResponse *)nil;
 }
 
 @end
@@ -348,7 +390,7 @@ static NSString* kContentType       = @"Content-Type";
 static NSString* kAppOcspRequest    = @"application/ocsp-request";
 static NSString* kContentLength     = @"Content-Length";
 static NSString* kUserAgent         = @"User-Agent";
-static NSString* kAppUserAgent      = @"ocspd/1.0.1";
+static NSString* kAppUserAgent      = @"ocspd/1.0.3";
 static NSString* kCacheControl      = @"Cache-Control";
 
 #if OCSP_DEBUG
@@ -391,6 +433,7 @@ CSSM_RETURN ocspdHttpFetch(
 	CSSM_RETURN result = CSSM_OK;
 	unsigned char *fullUrl = NULL;
 	CFURLRef cfUrl = NULL;
+	CFStringRef urlStr = NULL;
     CFDataRef postData = NULL;
     SecURLLoader *urlLoader = nil;
     bool done = false;
@@ -439,19 +482,40 @@ CSSM_RETURN ocspdHttpFetch(
 		goto cleanup;
 	}
 
+	if(urlLen && req64Len) {
+		CFStringRef incomingURLStr = CFStringCreateWithBytes(NULL, (const UInt8 *)url.Data, urlLen, kCFStringEncodingUTF8, false);
+		CFStringRef requestPathStr = CFStringCreateWithBytes(NULL, (const UInt8 *)req64, req64Len, kCFStringEncodingUTF8, false);
+		if(incomingURLStr && requestPathStr) {
+			/* percent-encode all reserved characters from RFC 3986 [2.2] */
+			CFStringRef encodedRequestStr = CFURLCreateStringByAddingPercentEscapes(NULL,
+				requestPathStr, NULL, CFSTR(":/?#[]@!$&'()*+,;="), kCFStringEncodingUTF8);
+			if(encodedRequestStr) {
+				CFMutableStringRef tempStr = CFStringCreateMutable(NULL, 0);
+				if (tempStr) {
+					CFStringAppend(tempStr, incomingURLStr);
+					CFStringAppend(tempStr, CFSTR("/"));
+					CFStringAppend(tempStr, encodedRequestStr);
+					urlStr = (CFStringRef)tempStr;
+				}
+			}
+			CFReleaseSafe(encodedRequestStr);
+		}
+		CFReleaseSafe(incomingURLStr);
+		CFReleaseSafe(requestPathStr);
+	}
+	if(urlStr == NULL) {
+		ocspdErrorLog("ocspdHttpFetch: error percent-encoding request\n");
+		result = CSSMERR_TP_INTERNAL_ERROR;
+		goto cleanup;
+	}
+
     /* RFC 5019 says we MUST use the GET method if the URI is less than 256 bytes
      * (to enable response caching), otherwise we SHOULD use the POST method.
      */
-	totalLen = urlLen + 1 + req64Len;
+	totalLen = CFStringGetLength(urlStr);
     if (totalLen < 256) {
         /* we can safely use GET */
-        fullUrl = (unsigned char *)malloc(totalLen);
-        memmove(fullUrl, url.Data, urlLen);
-        fullUrl[urlLen] = '/';
-        memmove(fullUrl + urlLen + 1, req64, req64Len);
-        cfUrl = CFURLCreateWithBytes(NULL, fullUrl, totalLen,
-                                     kCFStringEncodingUTF8,
-                                     NULL);
+		cfUrl = CFURLCreateWithString(NULL, urlStr, NULL);
     }
     else {
         /* request too big for GET; use POST instead */
@@ -464,7 +528,7 @@ CSSM_RETURN ocspdHttpFetch(
 
     if(cfUrl) {
         /* create URL with explicit path (see RFC 2616 3.2.2, 5.1.2) */
-       CFStringRef pathStr = CFURLCopyLastPathComponent(cfUrl);
+        CFStringRef pathStr = CFURLCopyLastPathComponent(cfUrl);
         if(pathStr) {
             if (CFStringGetLength(pathStr) == 0) {
                 CFURLRef tmpUrl = CFURLCreateCopyAppendingPathComponent(NULL, cfUrl, CFSTR(""), FALSE);
@@ -536,6 +600,7 @@ CSSM_RETURN ocspdHttpFetch(
 }	/* end autorelease scope */
 cleanup:
 	CFReleaseSafe(postData);
+	CFReleaseSafe(urlStr);
 	CFReleaseSafe(cfUrl);
 	if(fullUrl) {
 		free(fullUrl);
@@ -1072,10 +1137,41 @@ static void ocspdNetFetchAsync(
 	}
 }
 
+/*
+ * This is a basic "we have an internet connection" check.
+ * It tests whether IP 0.0.0.0 is routable.
+ */
+bool shouldAttemptNetFetch()
+{
+	bool result = true;
+	SCNetworkReachabilityRef scnr;
+	struct sockaddr_in addr;
+	bzero(&addr, sizeof(addr));
+	addr.sin_len = sizeof(addr);
+	addr.sin_family = AF_INET;
+
+	scnr = SCNetworkReachabilityCreateWithAddress(kCFAllocatorDefault, (const struct sockaddr *)&addr);
+	if (scnr) {
+		SCNetworkReachabilityFlags flags = 0;
+		if (SCNetworkReachabilityGetFlags(scnr, &flags)) {
+			if ((flags & kSCNetworkReachabilityFlagsReachable) == 0)
+				result = false;
+		}
+		CFRelease(scnr);
+	}
+	else { ocspdDebug("Failed to create reachability reference"); }
+	ocspdDebug("Finished reachability check, result=%s", (result) ? "YES" :"NO");
+
+	return result;
+}
+
 /* Kick off net fetch of a cert or a CRL and return immediately. */
 CSSM_RETURN ocspdStartNetFetch(
 	async_fetch_t		*fetchParams)
 {
+	if (!shouldAttemptNetFetch())
+		return CSSMERR_APPLETP_NETWORK_FAILURE;
+
 	dispatch_queue_t queue = dispatch_get_global_queue(
 		DISPATCH_QUEUE_PRIORITY_DEFAULT, 0);
 
